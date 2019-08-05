@@ -16,7 +16,7 @@ int f(int n) {
 }
 ```
 
-In this example, `a` can be represented as the CR `{30, +, 1}` and `i` as `{0, +, 2}`.
+In this example, using Chains of Recurrences, `a` can be represented by `{30, +, 1}` and `i` by `{0, +, 2}`.
 This implies that they can be represented by two lines: 
 1. `x + 30`  
 2. `2x + 0`  
@@ -74,3 +74,8 @@ a1*x + b1 = a2*x + b2
 ```
 This intersection point can then be used to split the loop.
 
+## References
+
+* [Loop splitting](https://en.wikipedia.org/wiki/Loop_splitting)
+* [Line-line intersection](https://en.wikipedia.org/wiki/Line%E2%80%93line_intersection)
+* [Chains of recurrenecs](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.43.8188&rep=rep1&type=pdf)
