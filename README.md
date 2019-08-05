@@ -18,8 +18,8 @@ int f(int n) {
 
 In this example, `a` can be represented as the CR `{30, +, 1}` and `i` as `{0, +, 2}`.
 This implies that they can be represented by two lines: 
-1. x + 30  
-2. 2x + 0  
+1. `x + 30`  
+2. `2x + 0`  
 
 These two lines intersect at:
 ```
@@ -63,7 +63,7 @@ int f_opt(int n) {
 ```
 For this general case, we will have the following line equations: 
 1. `a1*x + b1`
-2. `a2*x + b2 
+2. `a2*x + b2` 
 
 Such that their intersection point is:
 ```
