@@ -78,4 +78,5 @@ This intersection point can then be used to split the loop.
 
 * [Loop splitting](https://en.wikipedia.org/wiki/Loop_splitting)
 * [Line-line intersection](https://en.wikipedia.org/wiki/Line%E2%80%93line_intersection)
-* [Chains of recurrenecs](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.43.8188&rep=rep1&type=pdf)
+* [Chains of recurrences](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.43.8188&rep=rep1&type=pdf)
+* [SCEV (LLVM's Framework for Chains of Recurrences)](https://www.youtube.com/watch?v=AmjliNp0_00)
