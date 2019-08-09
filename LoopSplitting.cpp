@@ -18,32 +18,47 @@ namespace {
         static char ID; // Pass identification, replacement for typeid
         LoopSplitting() : FunctionPass(ID) {}
 
+        Value *getValueFromSCEV(const SCEV *scev) {
+            if (auto constant = dyn_cast<SCEVConstant>(scev)) {
+                return constant->getValue();
+            } else if (auto unknown = dyn_cast<SCEVUnknown>(scev)) {
+                return unknown->getValue();
+            }
+            llvm_unreachable("We only treat constant and unknown SCEVs");
+        }
+
         Value *calculateIntersectionPoint(const SCEVAddRecExpr *first,
                                           const SCEVAddRecExpr *second,
                                           LLVMContext *context) {
             assert(first->isAffine() && second->isAffine() && "SCEVs must be affine");
 
-            const auto& b1 = first->getOperand(0);
-            const auto& a1 = first->getOperand(1);
-            const auto& b2 = second->getOperand(0);
-            const auto& a2 = second->getOperand(1);
+            const auto b1 = getValueFromSCEV(first->getOperand(0));
+            const auto a1 = getValueFromSCEV(first->getOperand(1));
+            const auto b2 = getValueFromSCEV(second->getOperand(0));
+            const auto a2 = getValueFromSCEV(second->getOperand(1));
 
-            // se os valores do SCEV são todos conhecidos, calculamos o ponto
-            // de interseção diretamente
-            if (isa<SCEVConstant>(a1) && isa<SCEVConstant>(b1) &&
-                isa<SCEVConstant>(a2) && isa<SCEVConstant>(b2)) {
+//            qual código gerar quando as linhas são paralelas?
+//            (int) (((double) b2 - (double) b1) / ((double) a1 - (double) a2));
+//            %conv = sitofp i32 %b2 to double
+//            %conv1 = sitofp i32 %b1 to double
+//            %sub = fsub double %conv, %conv1
+//            %conv2 = sitofp i32 %a1 to double
+//            %conv3 = sitofp i32 %a2 to double
+//            %sub4 = fsub double %conv2, %conv3
+//            %div = fdiv double %sub, %sub4
+//            %conv5 = fptosi double %div to i32
 
-                const auto& a1Value = cast<SCEVConstant>(a1)->getAPInt();
-                const auto& b1Value = cast<SCEVConstant>(b1)->getAPInt();
-                const auto& a2Value = cast<SCEVConstant>(a2)->getAPInt();
-                const auto& b2Value = cast<SCEVConstant>(b2)->getAPInt();
+            IRBuilder<> builder(*context);
+            const auto b2Double = builder.CreateSIToFP(b2, Type::getDoubleTy(*context), "b2Double");
+            const auto b1Double = builder.CreateSIToFP(b1, Type::getDoubleTy(*context), "b1Double");
+            const auto bSub = builder.CreateFSub(b2Double, b1Double, "bSub");
+            const auto a2Double = builder.CreateSIToFP(a2, Type::getDoubleTy(*context), "a2Double");
+            const auto a1Double = builder.CreateSIToFP(a1, Type::getDoubleTy(*context), "a1Double");
+            const auto aSub = builder.CreateFSub(a1Double, a2Double, "aSub");
+            const auto div = builder.CreateFDiv(bSub, aSub, "div");
+            const auto convInt = builder.CreateFPToSI(div, Type::getInt32Ty(*context));
 
-                const auto& intersectionPoint = (b2Value - b1Value).sdiv(a1Value - a2Value);
-
-                return ConstantInt::get(IntegerType::getInt32Ty(*context), intersectionPoint);
-            }
-
-            return nullptr;
+            return convInt;
         }
 
         bool runOnFunction(Function &F) override {
@@ -70,7 +85,7 @@ namespace {
                                     const SCEVAddRecExpr* sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
                                     const SCEVAddRecExpr* sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
                                     if(sc0Add->isAffine() && sc1Add->isAffine()) {
-                                        const auto& result = calculateIntersectionPoint(sc0Add, sc1Add, &F.getContext());
+                                        const auto result = calculateIntersectionPoint(sc0Add, sc1Add, &F.getContext());
                                         result->dump();
                                     }
 
