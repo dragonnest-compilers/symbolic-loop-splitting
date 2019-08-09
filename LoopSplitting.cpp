@@ -39,14 +39,14 @@ namespace {
 
 //            qual código gerar quando as linhas são paralelas?
 //            (int) (((double) b2 - (double) b1) / ((double) a1 - (double) a2));
-//            %conv = sitofp i32 %b2 to double
-//            %conv1 = sitofp i32 %b1 to double
-//            %sub = fsub double %conv, %conv1
-//            %conv2 = sitofp i32 %a1 to double
-//            %conv3 = sitofp i32 %a2 to double
-//            %sub4 = fsub double %conv2, %conv3
-//            %div = fdiv double %sub, %sub4
-//            %conv5 = fptosi double %div to i32
+//            %b2Double = sitofp i32 %b2 to double
+//            %b1Double = sitofp i32 %b1 to double
+//            %bSub = fsub double %b2Double, %b1Double
+//            %a2Double = sitofp i32 %a2 to double
+//            %a1Double = sitofp i32 %a1 to double
+//            %aSub = fsub double %a1Double, %a2Double
+//            %div = fdiv double %bSub, %aSub
+//            %convInt = fptosi double %div to i32
 
             IRBuilder<> builder(*context);
             const auto b2Double = builder.CreateSIToFP(b2, Type::getDoubleTy(*context), "b2Double");
@@ -56,7 +56,7 @@ namespace {
             const auto a1Double = builder.CreateSIToFP(a1, Type::getDoubleTy(*context), "a1Double");
             const auto aSub = builder.CreateFSub(a1Double, a2Double, "aSub");
             const auto div = builder.CreateFDiv(bSub, aSub, "div");
-            const auto convInt = builder.CreateFPToSI(div, Type::getInt32Ty(*context));
+            const auto convInt = builder.CreateFPToSI(div, Type::getInt32Ty(*context), "convInt");
 
             return convInt;
         }
