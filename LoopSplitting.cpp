@@ -29,36 +29,46 @@ namespace {
 
         Value *calculateIntersectionPoint(const SCEVAddRecExpr *first,
                                           const SCEVAddRecExpr *second,
+                                          const CmpInst::Predicate predicate,
+                                          IRBuilder<> *builder,
                                           LLVMContext *context) {
             assert(first->isAffine() && second->isAffine() && "SCEVs must be affine");
+            assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT || predicate == CmpInst::ICMP_ULE ||
+                    predicate == CmpInst::ICMP_SGT || predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
+                    predicate == CmpInst::ICMP_SLE) && "We only treat integer inequalities for now");
 
             const auto b1 = getValueFromSCEV(first->getOperand(0));
             const auto a1 = getValueFromSCEV(first->getOperand(1));
             const auto b2 = getValueFromSCEV(second->getOperand(0));
             const auto a2 = getValueFromSCEV(second->getOperand(1));
 
-//            qual código gerar quando as linhas são paralelas?
-//            (int) (((double) b2 - (double) b1) / ((double) a1 - (double) a2));
-//            %b2Double = sitofp i32 %b2 to double
-//            %b1Double = sitofp i32 %b1 to double
-//            %bSub = fsub double %b2Double, %b1Double
-//            %a2Double = sitofp i32 %a2 to double
-//            %a1Double = sitofp i32 %a1 to double
-//            %aSub = fsub double %a1Double, %a2Double
-//            %div = fdiv double %bSub, %aSub
-//            %convInt = fptosi double %div to i32
 
-            IRBuilder<> builder(*context);
-            const auto b2Double = builder.CreateSIToFP(b2, Type::getDoubleTy(*context), "b2Double");
-            const auto b1Double = builder.CreateSIToFP(b1, Type::getDoubleTy(*context), "b1Double");
-            const auto bSub = builder.CreateFSub(b2Double, b1Double, "bSub");
-            const auto a2Double = builder.CreateSIToFP(a2, Type::getDoubleTy(*context), "a2Double");
-            const auto a1Double = builder.CreateSIToFP(a1, Type::getDoubleTy(*context), "a1Double");
-            const auto aSub = builder.CreateFSub(a1Double, a2Double, "aSub");
-            const auto div = builder.CreateFDiv(bSub, aSub, "div");
-            const auto convInt = builder.CreateFPToSI(div, Type::getInt32Ty(*context), "convInt");
+            // algoritmo:
+            // b = b2 - b1
+            // a = a1 - a2
+            // div = b / a
+            // se op == '>=' ou '<':
+            //      return div
+            // senão:
+            //      return b % a == 0 ? div : div + 1
+            const auto b = builder->CreateSub(b2, b1, "b"); // b2 - b1
+            const auto a = builder->CreateSub(a1, a2, "a"); // a1 - a2
+            const auto div = builder->CreateSDiv(b, a, "div"); // b / a
 
-            return convInt;
+            // se a comparação for > ou <= não precisamos verificar se é divisão exata,
+            // pois mesmo se não for queremos arredondar para baixo
+            if (predicate == CmpInst::ICMP_UGT || predicate == CmpInst::ICMP_SGT ||
+                predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SLE) {
+                return div;
+            } else {
+                // ou seja: return b % a == 0 ? div : div + 1
+                const auto rem = builder->CreateSRem(b, a, "rem"); // rem = b % a
+                const auto zero = ConstantInt::get(Type::getInt32Ty(*context), 0);
+                const auto divisible = builder->CreateICmp(CmpInst::ICMP_NE, rem, zero, "divisible"); // rem == 0 ? 0 : 1
+                const auto extended = builder->CreateZExt(divisible, IntegerType::getInt32Ty(*context), "extended"); // extends to 32 bits
+                const auto result = builder->CreateAdd(div, extended, "result");
+                return result;
+            }
         }
 
         bool runOnFunction(Function &F) override {
