@@ -1,0 +1,13 @@
+
+
+carrillo2009control.pdf
+
+"A Control-structure Splitting Optimization for GPGPU"
+Snaider Carrillo, Jakob Siegel, Xiaoming Li
+
+They mistakenly use the term loop splitting when they actually meant
+loop fission or loop distribution.
+
+------------------------------------------------------------------------
+
+
