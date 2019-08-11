@@ -122,9 +122,14 @@ namespace {
             const auto a1 = getValueFromSCEV(first->getOperand(1));
 
             const auto mul = builder.CreateMul(a1, SplitPoint);
+            // calcula o valor do y para o x encontrado
+            // assume que o y do for é o primeiro SCEV
+            // podemos mudar isso para getSCEV e evaluateAtIteration
             const auto y = builder.CreateAdd(mul, b1, "y");
 
-            const auto zero = ConstantInt::get(Type::getInt32Ty(F->getContext()), 0);
+            // para saber se qual reta é maior antes do ponto de interseção
+            // subtraimos um do X, calculamos o valor de ambas as retas para esse ponto
+            // e guardamos o resultado do primeiro < segundo em "isLess"
             const auto one = ConstantInt::get(Type::getInt32Ty(F->getContext()), 1);
             const auto before = builder.CreateSub(SplitPoint, one);
             const auto beforeSCEV = SE->getSCEV(before);
@@ -133,21 +138,49 @@ namespace {
             const auto isLess = builder.CreateICmp(CmpInst::ICMP_SLT,
                                                    firstBefore,
                                                    secondBefore);
+
             auto clonedLoop = cloneLoop(F, loop, loopInfo, "FirstLoop");
 
+            // setamos o limite do for para o valor de y calculado
+            // no nosso exemplo, isso mudaria o for de
+            // for (int i = 0; i < n; i += 2)
+            // para:
+            // for (int i = 0; i < 60; i += 2)
+            // isse assume que existe apenas um cmp dentro do header do loop
+            // depois temos que alterar para pegar o CMP de alguma outra forma
             BasicBlock *header = loop->getHeader();
             for (Instruction &inst: *header) {
                 if (CmpInst *cmp = dyn_cast<CmpInst>(&inst)) {
                     cmp->setOperand(1, y);
                 }
             }
+
+            // branch é um br que pula para o próximo bloco dentro
+            // do loop, ou pro bloco fora
             auto branch = cast<BranchInst>(header->getTerminator());
+            // condBlock é o proximo bloco dentro do loop
+            // assumimos que esse bloco é o que faz a comparação if (a < i)
+            // assumimos também que esse bloco é sempre o na posição 0
+            // depois temos que investigar se isso é verdade, e se não
+            // ver outra forma de distinguir qual bloco continua no loop
+            // e qual pula pra fora
             auto condBlock = branch->getSuccessor(0);
+
+            // setamos o segundo argumento do loop para pular para o loop clonado
+            // ao invés de pular para o retorno da função
             branch->setOperand(1, clonedLoop->getLoopPreheader());
 
+            // esa é a instruçnao que faz o if (a < i) no nosso exemplo
             if (CmpInst *cmp = dyn_cast<CmpInst>(condBlock->getFirstNonPHI())) {
-                cmp->setPredicate(CmpInst::ICMP_EQ);
+                cmp->setPredicate(CmpInst::ICMP_EQ); // setamos a comparação para "=="
+                // setamos o primeiro operando para se o primeiro SCEV é menos que o segundo
+                // antes do ponto de interseção
                 cmp->setOperand(0, isLess);
+
+                // se o predicado for < ou <=, setamos o segundo operando para true
+                // senão, false
+                // dessa forma, se o primeiro for menor que o segundo, e era isso que queriamos
+                // ficamos com if (true == true)
                 if (predicate == CmpInst::ICMP_SLT || predicate == CmpInst::ICMP_SLE) {
                     cmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
                 } else {
@@ -157,8 +190,10 @@ namespace {
 
             BasicBlock *clonedHeader = clonedLoop->getHeader();
             auto clonedBranch = cast<BranchInst>(clonedHeader->getTerminator());
+            // bloco com o if do loop clonado
             auto clonedCondBlock = clonedBranch->getSuccessor(0);
 
+            // mesma coisa que em cima, só que agora ao contrário
             if (CmpInst *cmp = dyn_cast<CmpInst>(clonedCondBlock->getFirstNonPHI())) {
                 cmp->setPredicate(CmpInst::ICMP_EQ);
                 cmp->setOperand(0, isLess);
@@ -171,9 +206,12 @@ namespace {
             }
 
             auto endCondBlock = clonedLoop->getExitBlock();
-            // temporário, adiciona no phi a segnda instrução do header
+            // temporário, adiciona no phi a segunda instrução do header
             // do bloco clonado por enquanto
             // iterando sobre todos pq não sei pegar só o segundo =/
+            // alteramos esse phi pois ele esperava receber o jmp
+            // do fim do primeiro loop, mas agora que vai pular
+            // para ele é o do segundo loop
             for (PHINode &node : endCondBlock->phis()) {
                 int i = 0;
                 for (Instruction &inst : clonedHeader->getInstList()) {
@@ -189,22 +227,15 @@ namespace {
             auto originalPhis = header->phis();
             auto clonedPhis = clonedHeader->phis();
 
+            // alteramos os phis do header do loop clonado para
+            // receberem o valor final dos equivalentes no loop original
+            // na primeira iteração do loop clonado
             auto original = originalPhis.begin();
             auto cloned = clonedPhis.begin();
             for (; original != originalPhis.end() && cloned != clonedPhis.end(); original++, cloned++) {
-                original->dump();
-                cloned->dump();
-
                 cloned->setIncomingValue(0, &*original);
             }
 
-//            %.02 = phi i32 [ 3, %1 ], [ %9, %10 ]
-//            %.01 = phi i32 [ 0, %1 ], [ %.1, %10 ]
-//            %.0 = phi i32 [ 1, %1 ], [ %11, %10 ]
-//
-//            %.02newLoop = phi i32 [ 3, %12 ], [ %20, %21 ]
-//            %.01newLoop = phi i32 [ 0, %12 ], [ %.1newLoop, %21 ]
-//            %.0newLoop = phi i32 [ 1, %12 ], [ %22, %21 ]
 
         }
 
