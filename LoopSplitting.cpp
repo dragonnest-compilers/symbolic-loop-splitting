@@ -134,8 +134,6 @@ namespace {
             auto clonedLoop = cloneLoop(F, loop, loopInfo, "FirstLoop", VMap);
 
 
-            //loop->getCanonicalInductionVariable()->dump();
-
             auto builder = IRBuilder<>(clonedLoop->getLoopPreheader()->getTerminator()); // builder a partir de onde?
 
             const SCEV* sc0 = SE->getSCEV(Cmp->getOperand(0));
@@ -282,7 +280,10 @@ namespace {
 
             for (PHINode &PHI : loop->getHeader()->phis()) {
               PHINode *ClonedPHI = dyn_cast<PHINode>(VMap[&PHI]);
-              Value *LastValue = ClonedPHI->getIncomingValueForBlock( clonedLoop->getLoopLatch() );
+              Value *LastValue = ClonedPHI;
+              if (clonedLoop->getExitingBlock()==clonedLoop->getLoopLatch()) {
+                LastValue = ClonedPHI->getIncomingValueForBlock( clonedLoop->getLoopLatch() );
+              } else assert(clonedLoop->getExitingBlock()==clonedLoop->getHeader() && "Expected exiting block to be the loop header!");
               PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()), LastValue );
             }
 
