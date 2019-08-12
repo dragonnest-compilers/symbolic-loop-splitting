@@ -76,40 +76,53 @@ namespace {
         }
 
         Loop *cloneLoop(Function *F,
-                        Loop *loop,
-                        LoopInfo *loopInfo,
-                        const Twine &NameSuffix) {
-            const auto predecessor = loop->getLoopPredecessor();
+                        Loop *L,
+                        LoopInfo *LI,
+                        const Twine &NameSuffix,
+                        ValueToValueMapTy &VMap) {
 
-            ValueToValueMapTy vMap;
-            auto dt = DominatorTree(*F);
+            //original preheader of the loop
+            const auto PreHeader = L->getLoopPreheader();
 
-            SmallVector<BasicBlock *, 8> blocks;
+            //keep track of the original predecessors
+            std::set<BasicBlock*> AllPredecessors;
+            for (auto PredIt = pred_begin(PreHeader), E = pred_end(PreHeader); PredIt!=E; PredIt++)
+              AllPredecessors.insert(*PredIt);
 
+            BasicBlock *ExitBlock = L->getExitBlock();
 
+            auto DT = DominatorTree(*F);
 
-            const auto clonedLoop = cloneLoopWithPreheader(loop->getExitBlock(),
-                                                           predecessor,
-                                                           loop,
-                                                           vMap,
-                                                           "newLoop",
-                                                           loopInfo,
-                                                           &dt,
-                                                           blocks);
+            SmallVector<BasicBlock *, 8> Blocks;
+            const auto ClonedLoop = cloneLoopWithPreheader(PreHeader,
+                                                           PreHeader,
+                                                           L,
+                                                           VMap,
+                                                           NameSuffix,
+                                                           LI,
+                                                           &DT,
+                                                           Blocks);
+            VMap[ExitBlock] = PreHeader; //chain: cloned loop -> original loop
+            remapInstructionsInBlocks(Blocks, VMap);
 
-            remapInstructionsInBlocks(blocks, vMap);
-            return clonedLoop;
+            //remap original predecessors to the cloned loop
+            for (BasicBlock *PredBB : AllPredecessors) {
+              Instruction *TI = PredBB->getTerminator();
+              for (unsigned i = 0; i<TI->getNumOperands(); i++) {
+                if (TI->getOperand(i)==PreHeader) TI->setOperand(i, ClonedLoop->getLoopPreheader());
+              }
+            }
+
+            return ClonedLoop;
         }
 
         void splitLoop(Function *F,
                        Loop *loop,
                        LoopInfo *loopInfo,
                        ScalarEvolution *SE,
-                       const CmpInst::Predicate predicate,
-                       const Instruction * BrOrSel,
-                       Value *SplitPoint,
-                       const SCEVAddRecExpr *first,
-                       const SCEVAddRecExpr *second) {
+                       CmpInst *Cmp) {
+
+            const CmpInst::Predicate predicate = Cmp->getPredicate();
 
             assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT ||
                     predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SGT ||
@@ -117,7 +130,28 @@ namespace {
                     predicate == CmpInst::ICMP_SLE) &&
                    "We only treat integer inequalities for now");
 
-            auto builder = IRBuilder<>(F->getContext()); // builder a partir de onde?
+            ValueToValueMapTy VMap;
+            auto clonedLoop = cloneLoop(F, loop, loopInfo, "FirstLoop", VMap);
+
+
+            //loop->getCanonicalInductionVariable()->dump();
+
+            auto builder = IRBuilder<>(clonedLoop->getLoopPreheader()->getTerminator()); // builder a partir de onde?
+
+            const SCEV* sc0 = SE->getSCEV(Cmp->getOperand(0));
+            const SCEV* sc1 = SE->getSCEV(Cmp->getOperand(1));
+            const SCEVAddRecExpr* sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
+            const SCEVAddRecExpr* sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
+
+            Value *SplitPoint = calculateIntersectionPoint(sc0Add,
+                                                           sc1Add,
+                                                           predicate,
+                                                           &builder,
+                                                           &F->getContext());
+
+            const SCEVAddRecExpr *first = sc0Add;
+            const SCEVAddRecExpr *second = sc1Add;
+
             const auto b1 = getValueFromSCEV(first->getOperand(0));
             const auto a1 = getValueFromSCEV(first->getOperand(1));
 
@@ -139,8 +173,6 @@ namespace {
                                                    firstBefore,
                                                    secondBefore);
 
-            auto clonedLoop = cloneLoop(F, loop, loopInfo, "FirstLoop");
-
             // setamos o limite do for para o valor de y calculado
             // no nosso exemplo, isso mudaria o for de
             // for (int i = 0; i < n; i += 2)
@@ -148,63 +180,74 @@ namespace {
             // for (int i = 0; i < 60; i += 2)
             // isse assume que existe apenas um cmp dentro do header do loop
             // depois temos que alterar para pegar o CMP de alguma outra forma
+            /*
             BasicBlock *header = loop->getHeader();
             for (Instruction &inst: *header) {
                 if (CmpInst *cmp = dyn_cast<CmpInst>(&inst)) {
                     cmp->setOperand(1, y);
                 }
             }
+            */
+            BranchInst *ClonedBr = dyn_cast<BranchInst>(clonedLoop->getExitingBlock()->getTerminator());
+            assert(ClonedBr->isConditional() && "Expected to be conditional!");
+            if (CmpInst *ExitCmp = dyn_cast<CmpInst>(ClonedBr->getCondition())) {
+              //TODO: improve this update
+              ExitCmp->setOperand(1,y);
+            }
 
+            //Desnecessário:
             // branch é um br que pula para o próximo bloco dentro
             // do loop, ou pro bloco fora
-            auto branch = cast<BranchInst>(header->getTerminator());
+            //auto branch = cast<BranchInst>(header->getTerminator());
             // condBlock é o proximo bloco dentro do loop
             // assumimos que esse bloco é o que faz a comparação if (a < i)
             // assumimos também que esse bloco é sempre o na posição 0
             // depois temos que investigar se isso é verdade, e se não
             // ver outra forma de distinguir qual bloco continua no loop
             // e qual pula pra fora
-            auto condBlock = branch->getSuccessor(0);
-
+            //auto condBlock = branch->getSuccessor(0);
             // setamos o segundo argumento do loop para pular para o loop clonado
             // ao invés de pular para o retorno da função
-            branch->setOperand(1, clonedLoop->getLoopPreheader());
+            //branch->setOperand(1, clonedLoop->getLoopPreheader());
 
-            // esa é a instruçnao que faz o if (a < i) no nosso exemplo
-            if (CmpInst *cmp = dyn_cast<CmpInst>(condBlock->getFirstNonPHI())) {
-                cmp->setPredicate(CmpInst::ICMP_EQ); // setamos a comparação para "=="
+
+            // I'm not sure what you wanted to do here, but OK for now
+            // essa é a instruçnao que faz o if (a < i) no nosso exemplo            
+//            if (CmpInst *cmp = dyn_cast<CmpInst>(condBlock->getFirstNonPHI())) {
+                Cmp->setPredicate(CmpInst::ICMP_EQ); // setamos a comparação para "=="
                 // setamos o primeiro operando para se o primeiro SCEV é menos que o segundo
                 // antes do ponto de interseção
-                cmp->setOperand(0, isLess);
+                Cmp->setOperand(0, isLess);
 
                 // se o predicado for < ou <=, setamos o segundo operando para true
                 // senão, false
                 // dessa forma, se o primeiro for menor que o segundo, e era isso que queriamos
                 // ficamos com if (true == true)
                 if (predicate == CmpInst::ICMP_SLT || predicate == CmpInst::ICMP_SLE) {
-                    cmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
+                    Cmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
                 } else {
-                    cmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
+                    Cmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
                 }
-            }
-
-            BasicBlock *clonedHeader = clonedLoop->getHeader();
-            auto clonedBranch = cast<BranchInst>(clonedHeader->getTerminator());
+            //}
+            
+            //BasicBlock *clonedHeader = clonedLoop->getHeader();
+            //auto clonedBranch = cast<BranchInst>(clonedHeader->getTerminator());
             // bloco com o if do loop clonado
-            auto clonedCondBlock = clonedBranch->getSuccessor(0);
+            //auto clonedCondBlock = clonedBranch->getSuccessor(0);
 
             // mesma coisa que em cima, só que agora ao contrário
-            if (CmpInst *cmp = dyn_cast<CmpInst>(clonedCondBlock->getFirstNonPHI())) {
-                cmp->setPredicate(CmpInst::ICMP_EQ);
-                cmp->setOperand(0, isLess);
+            if (CmpInst *ClonedCmp = dyn_cast<CmpInst>(VMap[Cmp])) {
+                ClonedCmp->setPredicate(CmpInst::ICMP_EQ);
+                ClonedCmp->setOperand(0, isLess);
 
                 if (predicate == CmpInst::ICMP_SLT || predicate == CmpInst::ICMP_SLE) {
-                    cmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
+                    ClonedCmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
                 } else {
-                    cmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
+                    ClonedCmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
                 }
             }
 
+            /*
             auto endCondBlock = clonedLoop->getExitBlock();
             // temporário, adiciona no phi a segunda instrução do header
             // do bloco clonado por enquanto
@@ -235,65 +278,86 @@ namespace {
             for (; original != originalPhis.end() && cloned != clonedPhis.end(); original++, cloned++) {
                 cloned->setIncomingValue(0, &*original);
             }
+            */
 
+            for (PHINode &PHI : loop->getHeader()->phis()) {
+              PHINode *ClonedPHI = dyn_cast<PHINode>(VMap[&PHI]);
+              Value *LastValue = ClonedPHI->getIncomingValueForBlock( clonedLoop->getLoopLatch() );
+              PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()), LastValue );
+            }
 
         }
 
-        bool runOnFunction(Function &F) override {
-            auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-            auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-            bool updated = false;
+    bool runOnFunction(Function &F) override {
+      auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+      auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+      bool updated = false;
 
+      std::vector< std::pair<Loop *, CmpInst *> > WorkList;
+      
+      for (Loop *L : LI) {
+        if (!L->getSubLoops().empty()) continue;
 
-            for(auto bb = F.begin(); bb != F.end(); bb++){
-                // bool a = LI.isLoopHeader(dyn_cast<BasicBlock>(bb));
-                if(!LI.isLoopHeader(dyn_cast<BasicBlock>(bb))){
-                    for(auto it = bb->begin(); it != bb->end(); it++){
+        BasicBlock *ExitingBB = L->getExitingBlock();
+        if (ExitingBB==nullptr) continue;
 
-                        if(CmpInst* inst = dyn_cast<CmpInst>(it)){
+        BranchInst *ExitingBr = dyn_cast<BranchInst>(ExitingBB->getTerminator());
+        if (ExitingBr==nullptr) continue;
 
-                            Value* op0 = inst->getOperand(0);
-                            Value* op1 = inst->getOperand(1);
-                            if(SE.isSCEVable(op0->getType()) && SE.isSCEVable(op1->getType())){
+        std::set<CmpInst*> AllCmps;
+        for (BasicBlock *BB : L->blocks()) {
+          for (Instruction &I : *BB) {
+            if (SelectInst *Sel = dyn_cast<SelectInst>(&I)) {
+              if(CmpInst* Cmp = dyn_cast<CmpInst>(Sel->getCondition())) AllCmps.insert(Cmp);
+            } else if (BranchInst *Br = dyn_cast<BranchInst>(BB->getTerminator())) {
+              if (Br && Br!=ExitingBr && Br->isConditional()) {
+                if(CmpInst* Cmp = dyn_cast<CmpInst>(Br->getCondition())) AllCmps.insert(Cmp);
+              }
+            }
+          }        
+        }
+        
+        if (AllCmps.size()!=1) continue;
 
-                                const SCEV* sc0 = SE.getSCEV(op0);
-                                const SCEV* sc1 = SE.getSCEV(op1);
-                                if(dyn_cast<SCEVAddRecExpr>(sc0) &&
-                                   dyn_cast<SCEVAddRecExpr>(sc1)){
-                                    
-                                    const SCEVAddRecExpr* sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
-                                    const SCEVAddRecExpr* sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
-                                    if(sc0Add->isAffine() && sc1Add->isAffine()) {
-                                        auto builder = IRBuilder<>(inst);
-                                        const auto result = calculateIntersectionPoint(sc0Add,
-                                                                                       sc1Add,
-                                                                                       inst->getPredicate(),
-                                                                                       &builder,
-                                                                                       &F.getContext());
-                                        result->dump();
-                                        auto loop = LI.getLoopsInPreorder()[0];
-                                        splitLoop(&F,
-                                                  loop,
-                                                  &LI,
-                                                  &SE,
-                                                  inst->getPredicate(),
-                                                  inst,
-                                                  result,
-                                                  sc0Add,
-                                                  sc1Add);
-                                        updated = true;
-                                    }
+        for (CmpInst *Cmp : AllCmps) {
+          Value* op0 = Cmp->getOperand(0);
+          Value* op1 = Cmp->getOperand(1);
+          if(SE.isSCEVable(op0->getType()) && SE.isSCEVable(op1->getType())){
+            const SCEV* sc0 = SE.getSCEV(op0);
+            const SCEV* sc1 = SE.getSCEV(op1);
 
-                                }
-                            }
+            if(dyn_cast<SCEVAddRecExpr>(sc0) && 
+              dyn_cast<SCEVAddRecExpr>(sc1)){
+                const SCEVAddRecExpr* sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
+                const SCEVAddRecExpr* sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
+                if(sc0Add->isAffine() && sc1Add->isAffine()) {
+                  //Cmp->dump();
+                  //sc0->dump();
+                  //sc1->dump();
 
-                        }
-                    }
+                  WorkList.push_back( std::pair<Loop*,CmpInst*>(L,Cmp) );
+
                 }
             }
-            F.dump();
-            return updated;
+          }
         }
+      }
+
+      for (auto &Pair : WorkList) {
+        Loop *L = Pair.first;
+        CmpInst *Cmp = Pair.second;
+
+        splitLoop(&F,
+                  L,
+                  &LI,
+                  &SE,
+                  Cmp);
+        updated = true;
+      }
+      errs() << "Modified Function:\n";
+      F.dump();
+      return updated;
+    }
 
         // We don't modify the program, so we preserve all analyses.
         void getAnalysisUsage(AnalysisUsage &AU) const override {
