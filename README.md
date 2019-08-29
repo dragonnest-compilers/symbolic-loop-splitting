@@ -87,7 +87,7 @@ For example
 
 we should resolve simbolically when both constraints are true. 
 
-# High level idea
+#### High level idea
 
 - Calculate truth intervals for both induction variables
 - In case of conjunctions, take interval where both are true
