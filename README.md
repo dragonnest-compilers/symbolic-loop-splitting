@@ -74,6 +74,25 @@ a1*x + b1 = a2*x + b2
 ```
 This intersection point can then be used to split the loop.
 
+### Disjunctions and conjunctions:
+
+Treat `and` and `or` operations.
+
+For example
+
+```
+    if {b1, +, a1} < {b2, +, a2} && {c1, +, d1} > {c2, +, d2} :
+      <body>
+```
+
+we should resolve simbolically when both constraints are true. 
+
+# High level idea
+
+- Calculate truth intervals for both induction variables
+- In case of conjunctions, take interval where both are true
+- In case of conjunctions, merge intervals, this will possibly generate multiple loop splits
+
 ## References
 
 * [Loop splitting](https://en.wikipedia.org/wiki/Loop_splitting)
