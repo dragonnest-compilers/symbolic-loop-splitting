@@ -1,0 +1,140 @@
+%\newcommand{\hack}[1]{#1}
+%\newenvironment{senumerate}{\begin{enumerate}[noitemsep,nolistsep]}{\end{enumerate}}
+%\newenvironment{sitemize}{\begin{itemize}[noitemsep,nolistsep]}{\end{itemize}}
+
+%\linespread{0.97}
+
+%% \documentclass[10pt,nocopyrightspace]{sigplanconf}
+
+
+% The following \documentclass options may be useful:
+
+% preprint      Remove this option only once the paper is in final form.
+% 10pt          To set in 10-point type instead of 9-point.
+% 11pt          To set in 11-point type instead of 9-point.
+% authoryear    To obtain author/year citation style instead of numeric.
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+
+%% BEGIN PREAMPLE
+\usepackage{graphicx}
+\usepackage{dblfloatfix}
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{amssymb}
+\usepackage{float}
+\usepackage{subfigure}
+\usepackage{multirow}           %tables
+\usepackage{rotating}           %tables
+\usepackage{enumitem}
+\usepackage{calc}
+\usepackage{flushend}
+\usepackage{balance}
+\usepackage{url}
+%% \usepackage[]{hyperref} %FOR CAMERA READY NO BOOKMARKS!
+%\usepackage[bookmarks=false,draft]{hyperref}
+
+
+\floatstyle{plain}              %USE \begin{myfloat}...stuff...\end{myfloat} to put stuff into a float
+\newfloat{myfloat}{thp}
+
+%% Listing related stuff
+\usepackage{listings}
+\usepackage{courier}            %Required for pretty listings (more dense)
+
+%% EMACS colors for listing:
+\usepackage{color}
+%% \definecolor{sh_comment}{rgb}{0.65, 0.00, 0.00 } % red-ish
+%% \definecolor{sh_keyword}{rgb}{0.37, 0.69, 0.69}  % blue-green
+%% \definecolor{sh_string}{rgb}{0.08, 0.69, 0.08} % green
+
+\definecolor{sh_comment}{rgb}{0.00, 0.50, 0.00 } % green
+\definecolor{sh_keyword}{rgb}{0.00, 0.00, 0.60 }  % blue-green
+\definecolor{sh_string}{rgb}{0.40, 0.20, 0.40 } % green
+
+
+%% This manipulates the listing numbering. It decreases it by one at the point used.
+\newcommand*\lstDNumber{\addtocounter{lstnumber}{-1}}
+
+\setlength{\dbltextfloatsep}{8pt}
+\setlength{\textfloatsep}{8pt}
+
+%% Change from Listing->Algorithm
+%% \renewcommand\lstlistingname{Algorithm} % Fix listing caption name: Listing -> Algorithm
+%% \renewcommand\lstlistlistingname{Algorithms}
+%% \def\lstlistingautorefname{Alg.}
+
+%% \renewcommand{\thelstlisting}{\thesection-\arabic{lstlisting}}
+%\renewcommand{\thelstlisting}{\arabic{lstlisting}} % Fix listing numbering Algorithm 1.1 -> Algorithm 1.
+
+%% \renewcommand{\labelenumi}{\roman{enumi}.}
+
+\lstset{
+float=[*],
+language=C,                % choose the language of the code
+%% basicstyle=\scriptsize\ttfamily,
+ basicstyle=\scriptsize\ttfamily,
+ stringstyle=\color{sh_string},
+ keywordstyle = \color{sh_keyword}\bfseries,
+ commentstyle=\color{sh_comment}\itshape,
+numbers=left,                   % where to put the line-numbers
+%% numberstyle=\scriptsize,        % the size of the fonts that are used for the line-numbers
+numberstyle=\scriptsize,        % the size of the fonts that are used for the line-numbers
+stepnumber=1,                   % the step between two line-numbers. If it is 1 each line will be numbered
+numbersep=5pt,                  % how far the line-numbers are from the code
+backgroundcolor=\color{white},  % choose the background color. You must add \usepackage{color}
+showspaces=false,               % show spaces adding particular underscores
+showstringspaces=false,         % underline spaces within strings
+showtabs=false,                 % show tabs within strings adding particular underscores
+xleftmargin=2em,                % Left margin
+frame=lines,                   % adds a frame around the code. none|leftline|topline|bottomline|lines|single|shadowbox
+framexleftmargin=1.5em,         % Margin from frame to line numbers
+framexbottommargin=0em,         % Distance from last text to frame
+morekeywords={in,not,and,or},
+%% prebreak=\mbox{\tiny$\searrow$},
+prebreak=\space,                % Line break: insert this character at the end of the top line
+%% postbreak=\mbox{{\color{blue}\scriptsize$\hookrightarrow$}}, % Line break: blue arrow at the beginning of the bottom line
+postbreak=\mbox{{\color{blue}\scriptsize$\hookrightarrow$}}, % Line break: blue arrow at the beginning of the bottom line
+breaklines=true,                % sets automatic line breaking
+breakatwhitespace=false,        % sets if automatic breaks should only happen at whitespace
+tabsize=2,                      % sets default tabsize to 2 spaces
+captionpos=t,                   % sets the caption-position to top
+escapeinside={@}{@}             % Escape sequence @ESCAPED STUFF@
+}
+
+%% Prevent footnotes from spanning multiple pages
+\interfootnotelinepenalty=10000
+
+%% Tables
+\usepackage{colortbl}
+\usepackage{color}
+\usepackage{booktabs}
+%\usepackage[table]{xcolor}
+\definecolor{oddcolor}{gray}{1.0}
+\definecolor{evencolor}{gray}{0.9}
+
+%% \newcommand{\refsec}[1]{section~\ref{#1}}
+\newcommand{\refSec}[1]{Section~\ref{#1}}
+\newcommand{\refSecs}[2]{Sections~\ref{#1}~and~\ref{#2}}
+%% \newcommand{\reffig}[1]{figure~\ref{#1}}
+\newcommand{\refFig}[1]{Figure~\ref{#1}}
+%% \newcommand{\reffigs}[2]{figures~\ref{#1} and~\ref{#2}}
+\newcommand{\refFigs}[2]{Figures~\ref{#1} and~\ref{#2}}
+\newcommand{\refFigss}[3]{Figures~\ref{#1},~\ref{#2} and~\ref{#3}}
+%% \newcommand{\reftab}[1]{table~\ref{#1}}
+\newcommand{\refTab}[1]{Table~\ref{#1}}
+%% \newcommand{\refalg}[1]{algorithm~\ref{#1}}
+\newcommand{\refAlg}[1]{Algorithm~\ref{#1}}
+
+\newcommand{\reflst}[1]{listing~\ref{#1}}
+\newcommand{\refLst}[1]{Listing~\ref{#1}}
+
+\newcommand{\todo}[1]{{\color{red}\large{#1}}}
+%\newcommand{\fixme}[1]{{\color{blue}\fbox{FIXME:} #1}}
+\newcommand{\update}{{\color{magenta}\fbox{Needs Update.}}}
+\newcommand{\code}[1]{{\ttfamily #1}}
+
+\newcommand{\fixme}[1]{}
+
+%% END OF PREAMPLE
