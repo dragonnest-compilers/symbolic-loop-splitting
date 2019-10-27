@@ -18,14 +18,14 @@ using namespace llvm;
 
 namespace {
     struct SplitInfo {
-        const SCEV *point;
+        Value *point;
         Value *iterationValue;
         Value *isTrueAtPoint;
         Value *nextValue;
         Value *isTrueAtNextPoint;
         CmpInst *comparison;
         
-        SplitInfo(const SCEV *point, Value *iterationValue, Value *isTrueAtPoint, Value *nextValue, Value *isTrueAtNextPoint, CmpInst *comparison) {
+        SplitInfo(Value *point, Value *iterationValue, Value *isTrueAtPoint, Value *nextValue, Value *isTrueAtNextPoint, CmpInst *comparison) {
             this->point = point;
             this->isTrueAtPoint = isTrueAtPoint;
             this->comparison = comparison;
@@ -44,6 +44,7 @@ namespace {
     public:
         LoopSplitting() : FunctionPass(ID) {}
         
+
         Value *calculateIntersectionPoint(const SCEVAddRecExpr *add,
                                           const SCEVConstant *constant,
                                           CmpInst *compare,
@@ -56,13 +57,18 @@ namespace {
                     predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
                     predicate == CmpInst::ICMP_SLE) &&
                    "We only treat integer inequalities for now");
-            
+            add->print(errs());
+            errs() << "\n";
             const auto b = this->expander->expandCodeFor(add->getOperand(0),
                                                          constant->getValue()->getType(),
                                                          compare->getParent()->getFirstNonPHI());
             const auto a = this->expander->expandCodeFor(add->getOperand(1),
                                                          constant->getValue()->getType(),
                                                          builder.GetInsertBlock()->getFirstNonPHI());
+            b->print(errs());
+            errs() << "\n";
+            a->print(errs());
+            errs() << "\n";
 
             const auto y = constant->getValue();
             
@@ -72,11 +78,10 @@ namespace {
 
             const auto temp1 = builder.CreateSub(y, b, "yMinusB"); // y - b
             const auto x = builder.CreateSDiv(temp1, a, "x"); // (y - b) / a
-            const auto biggerThanZero = builder.CreateICmpSGE(x, Constant::getNullValue(x->getType()), "biggerThan0");
-            const auto select = builder.CreateSelect(biggerThanZero, x, Constant::getNullValue(x->getType()), "select");
-            select->print(errs());
+//            const auto biggerThanZero = builder.CreateICmpSGE(x, Constant::getNullValue(x->getType()), "biggerThan0");
+//            const auto select = builder.CreateSelect(biggerThanZero, x, Constant::getNullValue(x->getType()), "select");
             
-            return select;
+            return x;
         }
 
         
@@ -146,6 +151,38 @@ namespace {
             return false;
         }
         
+        Loop * getLoop(CmpInst *comparison, LoopInfo &LI, ScalarEvolution &SE) {
+            const SCEVConstant *constant;
+            const SCEVAddRecExpr *affine;
+
+            if (isAffineAndConstantComparison(SE, *comparison)) {
+                auto first = SE.getSCEV(comparison->getOperand(0));
+                auto second = SE.getSCEV(comparison->getOperand(1));
+                
+                bool firstIsConstant = false;
+                if (first->getSCEVType() == scConstant) {
+                    constant = cast<SCEVConstant>(first);
+                    affine = cast<SCEVAddRecExpr>(second);
+                    firstIsConstant = true;
+                } else {
+                    constant = cast<SCEVConstant>(second);
+                    affine = cast<SCEVAddRecExpr>(first);
+                }
+            } else {
+                return nullptr;
+            }
+
+            auto loop = affine->getLoop();
+            auto tempLoop = LI.getLoopFor(comparison->getParent());
+
+            while (true) {
+                if (loop == tempLoop) {
+                    return tempLoop;
+                }
+                tempLoop = tempLoop->getParentLoop();
+            }
+        }
+        
         std::vector<SplitInfo> comparisonToSplitInfo(ScalarEvolution &SE,
                                                      LoopInfo &LI,
                                                      std::set<CmpInst *> &comparisons) {
@@ -167,12 +204,9 @@ namespace {
                         affine = cast<SCEVAddRecExpr>(first);
                     }
                     
-                    
-                    auto insertionPoint = LI.getLoopFor(instruction->getParent())->getLoopPreheader()->getFirstNonPHI();
-                    insertionPoint->print(errs());
+                    auto loop = getLoop(instruction, LI, SE);
+                    auto insertionPoint = loop->getLoopPreheader()->getFirstNonPHI();
                     auto builder = IRBuilder<>(insertionPoint);
-                    errs() << "\n";
-                    affine->print(errs());
 
                     auto value = calculateIntersectionPoint(affine, constant, instruction, builder);
                     auto scevValue = SE.getSCEV(value);
@@ -184,8 +218,6 @@ namespace {
                     auto nextIterationValue = expander->expandCodeFor(nextIterationScev,
                                                                       constant->getValue()->getType(), insertionPoint);
                     
-                    errs() << "\n";
-                    iterationValue->print(errs());
 
                     Value *v = builder.CreateICmp(instruction->getPredicate(),
                                                   firstIsConstant ? constant->getValue() : iterationValue,
@@ -193,8 +225,15 @@ namespace {
                     Value *nextPoint = builder.CreateICmp(instruction->getPredicate(),
                                                           firstIsConstant ? constant->getValue() : nextIterationValue,
                                                           firstIsConstant ? nextIterationValue : constant ->getValue());
-
-                    auto splitInfo = SplitInfo(scevValue, constant->getValue(), v, nextIterationValue, nextPoint, instruction);
+                    
+                    auto loopBranch = cast<BranchInst>(loop->getExitingBlock()->getTerminator());
+                    assert(loopBranch->isConditional() && "Expected to be conditional!");
+                    CmpInst *exitCmp = cast<CmpInst>(loopBranch->getCondition());
+                    auto loopScev = cast<SCEVAddRecExpr>(SE.getSCEV(exitCmp->getOperand(0)));
+                    auto loopEndValue = expander->expandCodeFor(loopScev->evaluateAtIteration(scevValue, SE), constant->getValue()->getType(), insertionPoint);
+                    
+                    auto valueAfterLoop = expander->expandCodeFor(loopScev->evaluateAtIteration(nextScevValue, SE), constant->getValue()->getType(), insertionPoint);
+                    auto splitInfo = SplitInfo(value, loopEndValue, v, valueAfterLoop, nextPoint, instruction);
                     splitInfoVector.push_back(splitInfo);
                 }
             }
@@ -237,8 +276,6 @@ namespace {
         void splitLoop(ScalarEvolution &SE, Function *F, Loop *loop, LoopInfo *LI, SplitInfo *info) {
             
             const CmpInst::Predicate predicate = info->comparison->getPredicate();
-            info->comparison->print(errs());
-            errs() << "\n";
             assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT ||
                     predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SGT ||
                     predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
@@ -265,9 +302,14 @@ namespace {
                 } else {
                     ExitCmp->setPredicate(CmpInst::ICMP_SLE);
                 }
-                ExitCmp->setOperand(1, info->iterationValue);
+                if (VMap[info->iterationValue]) {
+                    ExitCmp->setOperand(1, VMap[info->iterationValue]);
+                } else {
+                    ExitCmp->setOperand(1, info->iterationValue);
+                }
             }
 
+            int i = 0;
             for (PHINode &PHI : loop->getHeader()->phis()) {
                 PHI.print(errs());
                 errs() << "\n";
@@ -282,30 +324,29 @@ namespace {
                 } else
                     assert(clonedLoop->getExitingBlock() == clonedLoop->getHeader() &&
                            "Expected exiting block to be the loop header!");
-                PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()),
-                                     LastValue);
+                if (i == -1) {
+//                    ClonedPHI->setIncomingValue(0, ConstantInt::get(ClonedPHI->getType(), 0));
+                    PHI.setIncomingValue(0, info->nextValue);
+                } else {
+                    PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()),
+                                         LastValue);
+                }
+                i++;
             }
         }
         
         bool runOnFunction(Function &F) override {
             auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
             auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-            this->stream = &errs();
             
             this->expander = new SCEVExpander(SE, DataLayout(F.getParent()), "name");
-            F.print(errs());
-            errs() << "\n";
-            errs() << "\n";
 
             auto allComparisons = collectCandidateInstructions(LI);
             auto splitInfo = comparisonToSplitInfo(SE, LI, allComparisons);
             for (SplitInfo info : splitInfo) {
-                splitLoop(SE, &F, LI.getLoopFor(info.comparison->getParent()), &LI, &info);
+                splitLoop(SE, &F, getLoop(info.comparison, LI, SE), &LI, &info);
             }
             F.print(errs());
-            errs() << "\n";
-            errs() << "\n";
-
             return true;
         }
         
