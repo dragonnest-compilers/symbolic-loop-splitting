@@ -57,18 +57,12 @@ namespace {
                     predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
                     predicate == CmpInst::ICMP_SLE) &&
                    "We only treat integer inequalities for now");
-            add->print(errs());
-            errs() << "\n";
             const auto b = this->expander->expandCodeFor(add->getOperand(0),
                                                          constant->getValue()->getType(),
                                                          compare->getParent()->getFirstNonPHI());
             const auto a = this->expander->expandCodeFor(add->getOperand(1),
                                                          constant->getValue()->getType(),
                                                          builder.GetInsertBlock()->getFirstNonPHI());
-            b->print(errs());
-            errs() << "\n";
-            a->print(errs());
-            errs() << "\n";
 
             const auto y = constant->getValue();
             
@@ -96,6 +90,7 @@ namespace {
                     }
                 }
                 
+                
                 if (!L.isLoopExiting(BB)) {
                     BranchInst *Br = dyn_cast<BranchInst>(BB->getTerminator());
                     if (Br && Br->isConditional()) {
@@ -109,7 +104,10 @@ namespace {
         }
         
         std::set<CmpInst *> collectCandidateInstructions(Loop &loop) {
-            auto comparisons = getLoopComparisons(loop);
+            if (loop.getSubLoops().size() == 0) {
+                return getLoopComparisons(loop);
+            }
+            auto comparisons = std::set<CmpInst *>();
             for (Loop *subloop : loop.getSubLoops()) {
                 auto subLoopComparisons = getLoopComparisons(*subloop);
                 comparisons.insert(subLoopComparisons.begin(), subLoopComparisons.end());
@@ -126,9 +124,25 @@ namespace {
             return allComparisons;
         }
         
-        bool isAffineAndConstantComparison(ScalarEvolution &SE, CmpInst &comparison) {
+        bool isAffineAndConstantComparison(ScalarEvolution &SE, LoopInfo &LI, CmpInst &comparison) {
+            comparison.print(errs());
+            errs() << "\n";
             auto first = SE.getSCEV(comparison.getOperand(0));
             auto second = SE.getSCEV(comparison.getOperand(1));
+            if (first->getSCEVType() == SCEVTypes::scUnknown) {
+                Loop *loop = LI.getLoopFor(comparison.getParent());
+                auto PSE = PredicatedScalarEvolution(SE, *loop);
+                auto s = PSE.getAsAddRec(comparison.getOperand(0));
+                if (s != nullptr) {
+                    s->print(errs());
+                    errs() <<"\n";
+                }
+            }
+            first->getType()->print(errs());
+            errs() << "\n";
+            second->print(errs());
+            errs() << "\n";
+
             if ((first->getSCEVType() == scConstant || second->getSCEVType() == scConstant) &&
                 (first->getSCEVType() == scAddRecExpr || second->getSCEVType() == scAddRecExpr)) {
                 auto *addRec = dyn_cast<SCEVAddRecExpr>(first);
@@ -137,6 +151,7 @@ namespace {
                 }
                 return addRec->isAffine();
             }
+        
             return false;
         }
         
@@ -155,7 +170,7 @@ namespace {
             const SCEVConstant *constant;
             const SCEVAddRecExpr *affine;
 
-            if (isAffineAndConstantComparison(SE, *comparison)) {
+            if (isAffineAndConstantComparison(SE, LI, *comparison)) {
                 auto first = SE.getSCEV(comparison->getOperand(0));
                 auto second = SE.getSCEV(comparison->getOperand(1));
                 
@@ -188,7 +203,8 @@ namespace {
                                                      std::set<CmpInst *> &comparisons) {
             auto splitInfoVector = std::vector<SplitInfo>();
             for (CmpInst *instruction : comparisons) {
-                if (isAffineAndConstantComparison(SE, *instruction)) {
+                
+                if (isAffineAndConstantComparison(SE, LI, *instruction)) {
                     auto first = SE.getSCEV(instruction->getOperand(0));
                     auto second = SE.getSCEV(instruction->getOperand(1));
                     
@@ -284,14 +300,14 @@ namespace {
             
             // só funciona para < e >
             auto comparisonPredicate = info->comparison->getPredicate();
-            info->comparison->setOperand(0, ConstantInt::getFalse(F->getContext()));
+            info->comparison->setOperand(0, ConstantInt::getFalse(info->isTrueAtPoint->getType()));
             info->comparison->setOperand(1, info->isTrueAtNextPoint);
 
             info->comparison->setPredicate(ICmpInst::ICMP_EQ);
             
             ValueToValueMapTy VMap;
             auto clonedLoop = cloneLoop(F, loop, LI, "FirstLoop", VMap);
-            info->comparison->setOperand(0, ConstantInt::getTrue(F->getContext()));
+            info->comparison->setOperand(0, ConstantInt::getTrue(info->isTrueAtPoint->getType()));
 
 
             BranchInst *ClonedBr = cast<BranchInst>(clonedLoop->getExitingBlock()->getTerminator());
@@ -309,13 +325,8 @@ namespace {
                 }
             }
 
-            int i = 0;
             for (PHINode &PHI : loop->getHeader()->phis()) {
-                PHI.print(errs());
-                errs() << "\n";
                 PHINode *ClonedPHI = dyn_cast<PHINode>(VMap[&PHI]);
-                ClonedPHI->print(errs());
-                errs() << "\n";
 
                 Value *LastValue = ClonedPHI;
                 if (clonedLoop->getExitingBlock() == clonedLoop->getLoopLatch()) {
@@ -324,29 +335,31 @@ namespace {
                 } else
                     assert(clonedLoop->getExitingBlock() == clonedLoop->getHeader() &&
                            "Expected exiting block to be the loop header!");
-                if (i == -1) {
-//                    ClonedPHI->setIncomingValue(0, ConstantInt::get(ClonedPHI->getType(), 0));
-                    PHI.setIncomingValue(0, info->nextValue);
-                } else {
-                    PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()),
-                                         LastValue);
-                }
-                i++;
+                PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()),
+                                     LastValue);
             }
         }
         
         bool runOnFunction(Function &F) override {
-            auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-            auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-            
-            this->expander = new SCEVExpander(SE, DataLayout(F.getParent()), "name");
 
-            auto allComparisons = collectCandidateInstructions(LI);
-            auto splitInfo = comparisonToSplitInfo(SE, LI, allComparisons);
-            for (SplitInfo info : splitInfo) {
-                splitLoop(SE, &F, getLoop(info.comparison, LI, SE), &LI, &info);
+            while (true) {
+                auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+                auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+                this->expander = new SCEVExpander(SE, DataLayout(F.getParent()), "name");
+                auto allComparisons = collectCandidateInstructions(LI);
+                auto splitInfo = comparisonToSplitInfo(SE, LI, allComparisons);
+                if (splitInfo.size() == 0) {
+                    break;
+                }
+                for (auto splitInfo : splitInfo) {
+                    splitLoop(SE, &F, getLoop(splitInfo.comparison, LI, SE), &LI, &splitInfo);
+
+                }
+
+                F.print(errs());
+                errs() << "\n";
+                
             }
-            F.print(errs());
             return true;
         }
         
