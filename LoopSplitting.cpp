@@ -1,458 +1,507 @@
 #include "llvm/ADT/Statistic.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/Dominators.h"
-#include "llvm/IR/InstrTypes.h"
-#include "llvm/Pass.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Utils/LoopUtils.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ScalarEvolutionExpander.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <typeinfo>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "hello"
 
-namespace
-{
-  // Hello2 - The second implementation with getAnalysisUsage implemented.
-  struct LoopSplitting : public FunctionPass
-  {
-    static char ID; // Pass identification, replacement for typeid
-    LoopSplitting() : FunctionPass(ID) {}
+namespace {
+    struct SplitInfo {
+        Value *point;
+        Value *iterationValue;
+        Value *isTrueAtPoint;
+        Value *nextValue;
+        Value *isTrueAtNextPoint;
+        CmpInst *comparison;
+        int order;
+        
+        SplitInfo(Value *point, Value *iterationValue, Value *isTrueAtPoint, Value *nextValue, Value *isTrueAtNextPoint, CmpInst *comparison, int order) {
+            this->point = point;
+            this->isTrueAtPoint = isTrueAtPoint;
+            this->comparison = comparison;
+            this->iterationValue = iterationValue;
+            this->nextValue = nextValue;
+            this->isTrueAtNextPoint = isTrueAtNextPoint;
+            this->order = order;
 
-    Value *getValueFromSCEV(const SCEV *scev)
-    {
-      if (auto constant = dyn_cast<SCEVConstant>(scev))
-      {
-        return constant->getValue();
-      }
-      else if (auto unknown = dyn_cast<SCEVUnknown>(scev))
-      {
-        return unknown->getValue();
-      }
-
-      llvm_unreachable("We only treat constant and unknown SCEVs");
-    }
-
-    Value *calculateIntersectionPoint(const SCEVAddRecExpr *first,
-                                      const SCEVAddRecExpr *second,
-                                      const CmpInst::Predicate predicate,
-                                      IRBuilder<> *builder,
-                                      LLVMContext *context)
-    {
-      assert(first->isAffine() && second->isAffine() && "SCEVs must be affine");
-      assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT || predicate == CmpInst::ICMP_ULE ||
-              predicate == CmpInst::ICMP_SGT || predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
-              predicate == CmpInst::ICMP_SLE) &&
-            "We only treat integer inequalities for now");
-
-      const auto b1 = getValueFromSCEV(first->getOperand(0));
-      const auto a1 = getValueFromSCEV(first->getOperand(1));
-      const auto b2 = getValueFromSCEV(second->getOperand(0));
-      const auto a2 = getValueFromSCEV(second->getOperand(1));
-
-      // algoritmo:
-      // b = b2 - b1
-      // a = a1 - a2
-      // div = b / a
-      // se op == '>=' ou '<':
-      //      return div
-      // senão:
-      //      return b % a == 0 ? div : div + 1
-      const auto b = builder->CreateSub(b2, b1, "b");    // b2 - b1
-      const auto a = builder->CreateSub(a1, a2, "a");    // a1 - a2
-      const auto div = builder->CreateSDiv(b, a, "div"); // b / a
-
-      // se a comparação for > ou <= não precisamos verificar se é divisão exata,
-      // pois mesmo se não for queremos arredondar para baixo
-      if (predicate == CmpInst::ICMP_UGT || predicate == CmpInst::ICMP_SGT ||
-          predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SLE)
-      {
-        return div;
-      }
-      else
-      {
-        // ou seja: return b % a == 0 ? div : div + 1
-        const auto rem = builder->CreateSRem(b, a, "rem"); // rem = b % a
-        const auto zero = ConstantInt::get(Type::getInt32Ty(*context), 0);
-        const auto divisible = builder->CreateICmp(CmpInst::ICMP_NE, rem, zero, "divisible");                // rem == 0 ? 0 : 1
-        const auto extended = builder->CreateZExt(divisible, IntegerType::getInt32Ty(*context), "extended"); // extends to 32 bits
-        const auto result = builder->CreateAdd(div, extended, "result");
-        return result;
-      }
-    }
-
-    Loop *cloneLoop(Function *F,
-                    Loop *L,
-                    LoopInfo *LI,
-                    const Twine &NameSuffix,
-                    ValueToValueMapTy &VMap)
-    {
-
-      //original preheader of the loop
-      const auto PreHeader = L->getLoopPreheader();
-
-      //keep track of the original predecessors
-      std::set<BasicBlock *> AllPredecessors;
-      for (auto PredIt = pred_begin(PreHeader), E = pred_end(PreHeader); PredIt != E; PredIt++)
-        AllPredecessors.insert(*PredIt);
-
-      BasicBlock *ExitBlock = L->getExitBlock();
-
-      auto DT = DominatorTree(*F);
-
-      SmallVector<BasicBlock *, 8> Blocks;
-      const auto ClonedLoop = cloneLoopWithPreheader(PreHeader,
-                                                    PreHeader,
-                                                    L,
-                                                    VMap,
-                                                    NameSuffix,
-                                                    LI,
-                                                    &DT,
-                                                    Blocks);
-      VMap[ExitBlock] = PreHeader; //chain: cloned loop -> original loop
-      remapInstructionsInBlocks(Blocks, VMap);
-
-      //remap original predecessors to the cloned loop
-      for (BasicBlock *PredBB : AllPredecessors)
-      {
-        Instruction *TI = PredBB->getTerminator();
-        for (unsigned i = 0; i < TI->getNumOperands(); i++)
-        {
-          if (TI->getOperand(i) == PreHeader)
-            TI->setOperand(i, ClonedLoop->getLoopPreheader());
         }
-      }
+    };
+    // Hello2 - The second implementation with getAnalysisUsage implemented.
+    struct LoopSplitting : public FunctionPass {
+        static char ID; // Pass identification, replacement for typeid
+    private:
+        SCEVExpander *expander;
+        
+    public:
+        LoopSplitting() : FunctionPass(ID) {}
+        
+        Value * calculateIntersectionPoint(const SCEVAddRecExpr *first,
+                                          const SCEVAddRecExpr *second,
+                                          CmpInst *compare,
+                                          IRBuilder<> *builder) {
+            auto predicate = compare->getPredicate();
+            assert(first->isAffine() && second->isAffine() && "SCEVs must be affine");
+            assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT || predicate == CmpInst::ICMP_ULE ||
+                  predicate == CmpInst::ICMP_SGT || predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
+                  predicate == CmpInst::ICMP_SLE) &&
+                "We only treat integer inequalities for now");
+            const auto b1 = this->expander->expandCodeFor(first->getOperand(0),
+                                                          first->getOperand(1)->getType(),
+                                                          compare);
+            const auto a1 = this->expander->expandCodeFor(first->getOperand(1),
+                                                          first->getOperand(0)->getType(),
+                                                          compare);
+            const auto b2 = this->expander->expandCodeFor(second->getOperand(0),
+                                                          second->getOperand(1)->getType(),
+                                                          compare);
+            const auto a2 = this->expander->expandCodeFor(second->getOperand(1),
+                                                          second->getOperand(0)->getType(),
+                                                          compare);
 
-      return ClonedLoop;
-    }
+            const auto b = builder->CreateSub(b2, b1, "b");    // b2 - b1
+            const auto a = builder->CreateSub(a1, a2, "a");    // a1 - a2
+            const auto div = builder->CreateSDiv(b, a, "div"); // b / a
+            return div;
 
-    void splitLoop(Function *F,
-                  Loop *loop,
-                  LoopInfo *loopInfo,
-                  ScalarEvolution *SE,
-                  CmpInst *Cmp)
-    {
+        }
 
-      const CmpInst::Predicate predicate = Cmp->getPredicate();
+        
+        Value * calculateIntersectionPoint(const SCEVAddRecExpr *add,
+                                          Value *constant,
+                                          CmpInst *compare,
+                                          IRBuilder<> &builder) {
+            
+            auto predicate = compare->getPredicate();
+            assert(add->isAffine() && "SCEVs must be affine");
+            assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT ||
+                    predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SGT ||
+                    predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
+                    predicate == CmpInst::ICMP_SLE || predicate == CmpInst::ICMP_UGT) &&
+                   "We only treat integer inequalities for now");
+            const auto b = this->expander->expandCodeFor(add->getOperand(0),
+                                                         constant->getType(),
+                                                         compare->getParent()->getFirstNonPHI());
+            const auto a = this->expander->expandCodeFor(add->getOperand(1),
+                                                         constant->getType(),
+                                                         builder.GetInsertBlock()->getFirstNonPHI());
 
-      assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT ||
-              predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SGT ||
-              predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
-              predicate == CmpInst::ICMP_SLE) &&
-            "We only treat integer inequalities for now");
+            const auto y = constant;
+            
+            // Como y = ax + b
+            // colocamos como y a constante e calculamos x a partir disso:
+            // Ou seja: x = (y - b) / a
 
-      ValueToValueMapTy VMap;
-      auto clonedLoop = cloneLoop(F, loop, loopInfo, "FirstLoop", VMap);
+            const auto temp1 = builder.CreateSub(y, b, "yMinusB"); // y - b
+            const auto x = builder.CreateSDiv(temp1, a, "x"); // (y - b) / a
 
-      auto builder = IRBuilder<>(clonedLoop->getLoopPreheader()->getTerminator()); // builder a partir de onde?
+            return x;
+        }
+        
+  
 
-      const SCEV *sc0 = SE->getSCEV(Cmp->getOperand(0));
-      const SCEV *sc1 = SE->getSCEV(Cmp->getOperand(1));
-      const SCEVAddRecExpr *sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
-      const SCEVAddRecExpr *sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
-
-      Value *SplitPoint = calculateIntersectionPoint(sc0Add,
-                                                    sc1Add,
-                                                    predicate,
-                                                    &builder,
-                                                    &F->getContext());
-
-      const SCEVAddRecExpr *first = sc0Add;
-      const SCEVAddRecExpr *second = sc1Add;
-
-      const auto b1 = getValueFromSCEV(first->getOperand(0));
-      const auto a1 = getValueFromSCEV(first->getOperand(1));
-
-      const auto mul = builder.CreateMul(a1, SplitPoint);
-      // calcula o valor do y para o x encontrado
-      // assume que o y do for é o primeiro SCEV
-      // podemos mudar isso para getSCEV e evaluateAtIteration
-      const auto y = builder.CreateAdd(mul, b1, "y");
-
-      // para saber se qual reta é maior antes do ponto de interseção
-      // subtraimos um do X, calculamos o valor de ambas as retas para esse ponto
-      // e guardamos o resultado do primeiro < segundo em "isLess"
-      const auto one = ConstantInt::get(Type::getInt32Ty(F->getContext()), 1);
-      const auto before = builder.CreateSub(SplitPoint, one);
-      const auto beforeSCEV = SE->getSCEV(before);
-      auto firstBefore = getValueFromSCEV(first->evaluateAtIteration(beforeSCEV, *SE));
-      auto secondBefore = getValueFromSCEV(second->evaluateAtIteration(beforeSCEV, *SE));
-      const auto isLess = builder.CreateICmp(CmpInst::ICMP_SLT,
-                                            firstBefore,
-                                            secondBefore);
-
-      // setamos o limite do for para o valor de y calculado
-      // no nosso exemplo, isso mudaria o for de
-      // for (int i = 0; i < n; i += 2)
-      // para:
-      // for (int i = 0; i < 60; i += 2)
-      // isse assume que existe apenas um cmp dentro do header do loop
-      // depois temos que alterar para pegar o CMP de alguma outra forma
-      /*
-          BasicBlock *header = loop->getHeader();
-          for (Instruction &inst: *header) {
-            if (CmpInst *cmp = dyn_cast<CmpInst>(&inst)) {
-              cmp->setOperand(1, y);
+        bool isExiting(const Loop &L, BasicBlock *BB) {
+            bool exiting = L.isLoopExiting(BB);
+            for (Loop *loop : L.getSubLoops()) {
+                exiting = isExiting(*loop, BB) || exiting;
             }
-          }
-          */
-      BranchInst *ClonedBr = dyn_cast<BranchInst>(clonedLoop->getExitingBlock()->getTerminator());
-      assert(ClonedBr->isConditional() && "Expected to be conditional!");
-      if (CmpInst *ExitCmp = dyn_cast<CmpInst>(ClonedBr->getCondition()))
-      {
-        //TODO: improve this update
-        ExitCmp->setOperand(1, y);
-      }
-
-      //Desnecessário:
-      // branch é um br que pula para o próximo bloco dentro
-      // do loop, ou pro bloco fora
-      //auto branch = cast<BranchInst>(header->getTerminator());
-      // condBlock é o proximo bloco dentro do loop
-      // assumimos que esse bloco é o que faz a comparação if (a < i)
-      // assumimos também que esse bloco é sempre o na posição 0
-      // depois temos que investigar se isso é verdade, e se não
-      // ver outra forma de distinguir qual bloco continua no loop
-      // e qual pula pra fora
-      //auto condBlock = branch->getSuccessor(0);
-      // setamos o segundo argumento do loop para pular para o loop clonado
-      // ao invés de pular para o retorno da função
-      //branch->setOperand(1, clonedLoop->getLoopPreheader());
-
-      // I'm not sure what you wanted to do here, but OK for now
-      // essa é a instruçnao que faz o if (a < i) no nosso exemplo
-      //            if (CmpInst *cmp = dyn_cast<CmpInst>(condBlock->getFirstNonPHI())) {
-      Cmp->setPredicate(CmpInst::ICMP_EQ); // setamos a comparação para "=="
-      // setamos o primeiro operando para se o primeiro SCEV é menos que o segundo
-      // antes do ponto de interseção
-      Cmp->setOperand(0, isLess);
-
-      // se o predicado for < ou <=, setamos o segundo operando para true
-      // senão, false
-      // dessa forma, se o primeiro for menor que o segundo, e era isso que queriamos
-      // ficamos com if (true == true)
-      if (predicate == CmpInst::ICMP_SLT || predicate == CmpInst::ICMP_SLE)
-      {
-        Cmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
-      }
-      else
-      {
-        Cmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
-      }
-      //}
-
-      //BasicBlock *clonedHeader = clonedLoop->getHeader();
-      //auto clonedBranch = cast<BranchInst>(clonedHeader->getTerminator());
-      // bloco com o if do loop clonado
-      //auto clonedCondBlock = clonedBranch->getSuccessor(0);
-
-      // mesma coisa que em cima, só que agora ao contrário
-      if (CmpInst *ClonedCmp = dyn_cast<CmpInst>(VMap[Cmp]))
-      {
-        ClonedCmp->setPredicate(CmpInst::ICMP_EQ);
-        ClonedCmp->setOperand(0, isLess);
-
-        if (predicate == CmpInst::ICMP_SLT || predicate == CmpInst::ICMP_SLE)
-        {
-          ClonedCmp->setOperand(1, ConstantInt::getFalse(F->getContext()));
+            return exiting;
         }
-        else
-        {
-          ClonedCmp->setOperand(1, ConstantInt::getTrue(F->getContext()));
-        }
-      }
-
-      /*
-          auto endCondBlock = clonedLoop->getExitBlock();
-          // temporário, adiciona no phi a segunda instrução do header
-          // do bloco clonado por enquanto
-          // iterando sobre todos pq não sei pegar só o segundo =/
-          // alteramos esse phi pois ele esperava receber o jmp
-          // do fim do primeiro loop, mas agora que vai pular
-          // para ele é o do segundo loop
-          for (PHINode &node : endCondBlock->phis()) {
-            int i = 0;
-            for (Instruction &inst : clonedHeader->getInstList()) {
-              if (i == 1) {
-                node.addIncoming(&inst, clonedHeader);
-                node.removeIncomingValue(header);
-                break;
-              }
-              i++;
+        
+        std::set<CmpInst *> getLoopComparisons(LoopInfo &LI, const Loop &L) {
+            std::set<CmpInst *> AllCmps;
+            
+            for (BasicBlock *BB : L.blocks()) {
+                for (Instruction &I : *BB) {
+                    if (SelectInst *Sel = dyn_cast<SelectInst>(&I)) {
+                        if (CmpInst *Cmp = dyn_cast<CmpInst>(Sel->getCondition()))
+                            AllCmps.insert(Cmp);
+                    }
+                }
+                
+                bool exiting = false;
+                for (Loop *loop : LI) {
+                    exiting = isExiting(*loop, BB);
+                }
+                if (!LI.getLoopFor(BB)->isLoopExiting(BB)) {
+                    BranchInst *Br = dyn_cast<BranchInst>(BB->getTerminator());
+                    if (Br && Br->isConditional()) {
+                        if (CmpInst *Cmp = dyn_cast<CmpInst>(Br->getCondition())) {
+                            AllCmps.insert(Cmp);
+                        }
+                    }
+                }
             }
-            break;
-          }
-          auto originalPhis = header->phis();
-          auto clonedPhis = clonedHeader->phis();
-
-          // alteramos os phis do header do loop clonado para
-          // receberem o valor final dos equivalentes no loop original
-          // na primeira iteração do loop clonado
-          auto original = originalPhis.begin();
-          auto cloned = clonedPhis.begin();
-          for (; original != originalPhis.end() && cloned != clonedPhis.end(); original++, cloned++) {
-            cloned->setIncomingValue(0, &*original);
-          }
-          */
-
-      for (PHINode &PHI : loop->getHeader()->phis())
-      {
-        PHINode *ClonedPHI = dyn_cast<PHINode>(VMap[&PHI]);
-        Value *LastValue = ClonedPHI;
-        if (clonedLoop->getExitingBlock() == clonedLoop->getLoopLatch())
-        {
-          LastValue = ClonedPHI->getIncomingValueForBlock(clonedLoop->getLoopLatch());
+            
+            return AllCmps;
         }
-        else
-          assert(clonedLoop->getExitingBlock() == clonedLoop->getHeader() && "Expected exiting block to be the loop header!");
-        PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()), LastValue);
-      }
-    }
-
-    bool isAValidLoop(Loop *L)
-    {
-      if (!L->getSubLoops().empty())
-        return false;
-
-      BasicBlock *ExitingBB = L->getExitingBlock();
-      if (ExitingBB == nullptr)
-        return false;
-
-      BranchInst *ExitingBr = dyn_cast<BranchInst>(ExitingBB->getTerminator());
-      if (ExitingBr == nullptr)
-        return false;
-
-      return true;
-    }
-
-    std::set<CmpInst *> GetAllCmps(Loop *L)
-    {
-      std::set<CmpInst *> AllCmps;
-
-      for (BasicBlock *BB : L->blocks())
-      {
-        for (Instruction &I : *BB)
-        {
-          if (SelectInst *Sel = dyn_cast<SelectInst>(&I))
-          {
-            if (CmpInst *Cmp = dyn_cast<CmpInst>(Sel->getCondition()))
-              AllCmps.insert(Cmp);
-          }
-        }
-
-        if (!L->isLoopExiting(BB))
-        {
-          BranchInst *Br = dyn_cast<BranchInst>(BB->getTerminator());
-          if (Br && Br->isConditional())
-          {
-            if (CmpInst *Cmp = dyn_cast<CmpInst>(Br->getCondition()))
-              AllCmps.insert(Cmp);
-          }
-        }
-      }
-
-      return AllCmps;
-    }
-
-    std::vector<std::pair<Loop *, CmpInst *>>
-    getPairFromCmp(ScalarEvolution &SE, std::set<CmpInst *> AllCmps, Loop *L)
-    {
-
-      std::vector<std::pair<Loop *, CmpInst *>> WorkList;
-      for (CmpInst *Cmp : AllCmps)
-      {
-        Value *op0 = Cmp->getOperand(0);
-        Value *op1 = Cmp->getOperand(1);
-        if (SE.isSCEVable(op0->getType()) && SE.isSCEVable(op1->getType()))
-        {
-          const SCEV *sc0 = SE.getSCEV(op0);
-          const SCEV *sc1 = SE.getSCEV(op1);
-
-          if (dyn_cast<SCEVAddRecExpr>(sc0) && dyn_cast<SCEVAddRecExpr>(sc1))
-          {
-            const SCEVAddRecExpr *sc0Add = dyn_cast<SCEVAddRecExpr>(sc0);
-            const SCEVAddRecExpr *sc1Add = dyn_cast<SCEVAddRecExpr>(sc1);
-            if (sc0Add->isAffine() && sc1Add->isAffine())
-            {
-              // Cmp->dump();
-              // sc0->dump();
-              // sc1->dump();
-
-              WorkList.push_back(std::pair<Loop *, CmpInst *>(L, Cmp));
+        
+        std::set<CmpInst *> collectCandidateInstructions(LoopInfo &LI, Loop &loop) {
+            auto comparisons = std::set<CmpInst *>();
+            for (Loop *subloop : loop.getSubLoops()) {
+                auto subLoopComparisons = collectCandidateInstructions(LI, *subloop);
+                comparisons.insert(subLoopComparisons.begin(), subLoopComparisons.end());
             }
-          }
+            auto loopComparisons = getLoopComparisons(LI, loop);
+            comparisons.insert(loopComparisons.begin(), loopComparisons.end());
+            return comparisons;
         }
-      }
+        
+        std::set<CmpInst *> collectCandidateInstructions(LoopInfo &LI) {
+            auto allComparisons = std::set<CmpInst *>();
+            for (Loop *loop : LI) {
+                auto loopComparisons = collectCandidateInstructions(LI, *loop);
+                allComparisons.insert(loopComparisons.begin(), loopComparisons.end());
+            }
+            return allComparisons;
+        }
+        
+        bool isAffineAndConstantComparison(ScalarEvolution &SE, CmpInst &comparison) {
+            auto first = SE.getSCEV(comparison.getOperand(0));
+            auto second = SE.getSCEV(comparison.getOperand(1));
+            if ((first->getSCEVType() == scConstant || second->getSCEVType() == scConstant) &&
+                (first->getSCEVType() == scAddRecExpr || second->getSCEVType() == scAddRecExpr)) {
+                auto *addRec = dyn_cast<SCEVAddRecExpr>(first);
+                if (addRec == nullptr) {
+                    addRec = dyn_cast<SCEVAddRecExpr>(second);
+                }
+                return addRec->isAffine();
+            }
+        
+            return false;
+        }
+        
+        bool isBothAffineComparison(ScalarEvolution &SE, CmpInst &comparison) {
+            auto first = SE.getSCEV(comparison.getOperand(0));
+            auto second = SE.getSCEV(comparison.getOperand(1));
+            if (first->getSCEVType() == scAddRecExpr && second->getSCEVType() == scAddRecExpr) {
+                auto *firstAddRec = cast<SCEVAddRecExpr>(first);
+                auto *secondAddRec = cast<SCEVAddRecExpr>(second);
+                return firstAddRec->isAffine() && secondAddRec->isAffine();
+            }
+            return false;
+        }
+        
+        Loop * getLoop(CmpInst *comparison, LoopInfo &LI, ScalarEvolution &SE) {
 
-      return WorkList;
-    }
+            if (isAffineAndConstantComparison(SE, *comparison)) {
+                const SCEVAddRecExpr *affine;
+                auto first = SE.getSCEV(comparison->getOperand(0));
+                auto second = SE.getSCEV(comparison->getOperand(1));
+                
+                if (first->getSCEVType() == scConstant) {
+                    affine = cast<SCEVAddRecExpr>(second);
+                } else {
+                    affine = cast<SCEVAddRecExpr>(first);
+                }
+                auto loop = affine->getLoop(); // const reference, find it in hierarchy :(
+                auto tempLoop = LI.getLoopFor(comparison->getParent());
 
-    bool analyseLoops(Function &F, llvm::LoopInfo &LI,
-                      llvm::ScalarEvolution &SE)
-    {
-      bool updated = false;
-      std::vector<std::pair<Loop *, CmpInst *>> WorkList;
+                while (true) {
+                    if (loop == tempLoop) {
+                        return tempLoop;
+                    }
+                    
+                    tempLoop = tempLoop->getParentLoop();
+                }
 
-      for (Loop *L : LI)
-      {
+            } else if (isBothAffineComparison(SE, *comparison)) {
+                auto firstAffine = cast<SCEVAddRecExpr>(SE.getSCEV(comparison->getOperand(0)));
+                auto secondAffine = cast<SCEVAddRecExpr>(SE.getSCEV(comparison->getOperand(1)));
+                
+                auto firstLoop = firstAffine->getLoop();
+                auto secondLoop = secondAffine->getLoop();
+                auto tempLoop = LI.getLoopFor(comparison->getParent());
+                while (true) {
+                    if (firstLoop == tempLoop || secondLoop == tempLoop) {
+                        return tempLoop;
+                    }
+                    tempLoop = tempLoop->getParentLoop();
+                }
+            }
+            return nullptr;
 
-        if (!isAValidLoop(L))
-        {
-          continue;
+
+        }
+        
+        
+        SplitInfo *splitInforForAddRecAndConstant(ScalarEvolution &SE,
+                                                  LoopInfo &LI,
+                                                  CmpInst *instruction,
+                                                  const SCEVAddRecExpr *affine,
+                                                  Value *constant,
+                                                  bool firstIsConstant,
+                                                  Instruction *constantInstruction = nullptr) {
+            constant->print(errs());
+            errs() << "\n";
+            auto loop = getLoop(instruction, LI, SE);
+            
+            auto insertionPoint = loop->getLoopPreheader()->getTerminator();
+            auto builder = IRBuilder<>(insertionPoint);
+            
+            if (constantInstruction != nullptr)
+                builder.Insert(constantInstruction);
+                
+            auto value = calculateIntersectionPoint(affine, constant, instruction, builder);
+            auto scevValue = SE.getSCEV(value);
+            auto iterationScev = affine->evaluateAtIteration(scevValue, SE);
+            auto iterationValue = expander->expandCodeFor(iterationScev, constant->getType(), insertionPoint);
+            
+            auto nextScevValue = SE.getAddExpr(scevValue, SE.getOne(value->getType()));
+            auto nextIterationScev = affine->evaluateAtIteration(nextScevValue, SE);
+            auto nextIterationValue = expander->expandCodeFor(nextIterationScev,
+                                                              constant->getType(), insertionPoint);
+            
+            Value *v = builder.CreateICmp(instruction->getPredicate(),
+                                          firstIsConstant ? constant : iterationValue,
+                                          firstIsConstant ? iterationValue : constant);
+            Value *nextPoint = builder.CreateICmp(instruction->getPredicate(),
+                                                  firstIsConstant ? constant : nextIterationValue,
+                                                  firstIsConstant ? nextIterationValue : constant);
+            
+            auto loopBranch = cast<BranchInst>(loop->getExitingBlock()->getTerminator());
+            assert(loopBranch->isConditional() && "Expected to be conditional!");
+            CmpInst *exitCmp = cast<CmpInst>(loopBranch->getCondition());
+
+            auto loopScev = cast<SCEVAddRecExpr>(SE.getSCEV(exitCmp->getOperand(0)));
+            auto loopEndValue = expander->expandCodeFor(loopScev->evaluateAtIteration(scevValue, SE), constant->getType(), insertionPoint);
+
+            auto valueAfterLoop = expander->expandCodeFor(loopScev->evaluateAtIteration(nextScevValue, SE), constant->getType(), insertionPoint);
+            auto splitInfo = new SplitInfo(value, loopEndValue, v, valueAfterLoop, nextPoint, instruction, firstIsConstant ? 0 : 1);
+            return splitInfo;
+        }
+        std::vector<SplitInfo> comparisonToSplitInfo(ScalarEvolution &SE,
+                                                     LoopInfo &LI,
+                                                     std::set<CmpInst *> &comparisons) {
+            auto splitInfoVector = std::vector<SplitInfo>();
+            for (CmpInst *instruction : comparisons) {
+                if (isAffineAndConstantComparison(SE, *instruction)) {
+                    auto first = SE.getSCEV(instruction->getOperand(0));
+                    auto second = SE.getSCEV(instruction->getOperand(1));
+                    
+                    const SCEVConstant *constant;
+                    const SCEVAddRecExpr *affine;
+                    bool firstIsConstant = false;
+                    if (first->getSCEVType() == scConstant) {
+                        constant = cast<SCEVConstant>(first);
+                        affine = cast<SCEVAddRecExpr>(second);
+                        firstIsConstant = true;
+                    } else {
+                        constant = cast<SCEVConstant>(second);
+                        affine = cast<SCEVAddRecExpr>(first);
+                    }
+                    
+                    auto splitInfo = splitInforForAddRecAndConstant(SE,
+                                                                    LI,
+                                                                    instruction,
+                                                                    affine,
+                                                                    constant->getValue(),
+                                                                    firstIsConstant);
+                    splitInfoVector.push_back(*splitInfo);
+                } else if (isBothAffineComparison(SE, *instruction)) {
+                    auto firstAffine = cast<SCEVAddRecExpr>(SE.getSCEV(instruction->getOperand(0)));
+                    auto secondAffine = cast<SCEVAddRecExpr>(SE.getSCEV(instruction->getOperand(1)));
+                    if (firstAffine->getLoop() == secondAffine->getLoop()) {
+                        auto loop = getLoop(instruction, LI, SE);
+                        auto insertionPoint = loop->getLoopPreheader()->getFirstNonPHI();
+                        auto builder = IRBuilder<>(insertionPoint);
+                        
+                        auto value = calculateIntersectionPoint(firstAffine, secondAffine, instruction, &builder);
+                        auto scevValue = SE.getSCEV(value);
+
+                        auto firstIterationScev = firstAffine->evaluateAtIteration(scevValue, SE);
+                        auto firstIterationValue = expander->expandCodeFor(firstIterationScev, value->getType(), insertionPoint);
+
+                        auto secondIterationScev = secondAffine->evaluateAtIteration(scevValue, SE);
+                        auto secondIterationValue = expander->expandCodeFor(secondIterationScev, value->getType(), insertionPoint);
+
+                        auto nextScevValue = SE.getAddExpr(scevValue, SE.getOne(value->getType()));
+
+                        auto firstNextIterationScev = firstAffine->evaluateAtIteration(nextScevValue, SE);
+
+                        auto firstNextIterationValue = expander->expandCodeFor(firstNextIterationScev,
+                                                                               value->getType(),
+                                                                               insertionPoint);
+
+                        auto secondNextIterationScev = secondAffine->evaluateAtIteration(nextScevValue, SE);
+
+                        auto secondNextIterationValue = expander->expandCodeFor(secondNextIterationScev,
+                                                                          value->getType(), insertionPoint);
+
+                        Value *v = builder.CreateICmp(instruction->getPredicate(), firstIterationValue, secondIterationValue);
+
+                        Value *nextPoint = builder.CreateICmp(instruction->getPredicate(), firstNextIterationValue, secondNextIterationValue);
+
+                        auto loopBranch = cast<BranchInst>(loop->getExitingBlock()->getTerminator());
+                        assert(loopBranch->isConditional() && "Expected to be conditional!");
+                        CmpInst *exitCmp = cast<CmpInst>(loopBranch->getCondition());
+                        auto loopScev = cast<SCEVAddRecExpr>(SE.getSCEV(exitCmp->getOperand(0)));
+                        auto loopEndValue = expander->expandCodeFor(loopScev->evaluateAtIteration(scevValue, SE), value->getType(), insertionPoint);
+
+                        auto valueAfterLoop = expander->expandCodeFor(loopScev->evaluateAtIteration(nextScevValue, SE), value->getType(), insertionPoint);
+                        auto splitInfo = SplitInfo(value, loopEndValue, v, valueAfterLoop, nextPoint, instruction, 0);
+                        splitInfoVector.push_back(splitInfo);
+                    } else {
+                        auto firstLoop = firstAffine->getLoop();
+                        auto secondLoop = secondAffine->getLoop();
+                        
+                        if (firstLoop->contains(secondLoop)) {
+                            SplitInfo *splitInfo =splitInfo = splitInforForAddRecAndConstant(SE, LI, instruction, secondAffine, instruction->getOperand(0), true);
+                            splitInfoVector.push_back(*splitInfo);
+                        } else if (secondLoop->contains(firstLoop)) {
+                            SplitInfo *splitInfo=  splitInforForAddRecAndConstant(SE, LI, instruction, firstAffine, instruction->getOperand(1), false);
+                            splitInfoVector.push_back(*splitInfo);
+                        }
+                    }
+
+                }
+            }
+            return splitInfoVector;
+        }
+        
+        Loop *cloneLoop(Function *F, Loop *L, LoopInfo *LI, DominatorTree &DT, const Twine &NameSuffix,
+                ValueToValueMapTy &VMap) {
+    
+        // original preheader of the loop
+            const auto PreHeader = L->getLoopPreheader();
+            
+            // keep track of the original predecessors
+            std::set<BasicBlock *> AllPredecessors;
+            for (auto PredIt = pred_begin(PreHeader), E = pred_end(PreHeader);
+                 PredIt != E; PredIt++)
+                AllPredecessors.insert(*PredIt);
+            
+            BasicBlock *ExitBlock = L->getExitBlock();
+            
+            
+            SmallVector<BasicBlock *, 8> Blocks;
+            
+            const auto ClonedLoop = cloneLoopWithPreheader(PreHeader, PreHeader, L, VMap, NameSuffix, LI, &DT, Blocks);
+            VMap[ExitBlock] = PreHeader; // chain: cloned loop -> original loop
+            remapInstructionsInBlocks(Blocks, VMap);
+            
+            // remap original predecessors to the cloned loop
+            for (BasicBlock *PredBB : AllPredecessors) {
+                Instruction *TI = PredBB->getTerminator();
+                for (unsigned i = 0; i < TI->getNumOperands(); i++) {
+                    if (TI->getOperand(i) == PreHeader)
+                        TI->setOperand(i, ClonedLoop->getLoopPreheader());
+                }
+            }
+            
+            return ClonedLoop;
         }
 
-        std::set<CmpInst *> AllCmps = GetAllCmps(L);
+        void splitLoop(ScalarEvolution &SE, Function *F, DominatorTree &DT, Loop *loop, LoopInfo *LI, SplitInfo *info) {
+            const CmpInst::Predicate predicate = info->comparison->getPredicate();
+            assert((predicate == CmpInst::ICMP_UGE || predicate == CmpInst::ICMP_ULT ||
+                    predicate == CmpInst::ICMP_ULE || predicate == CmpInst::ICMP_SGT ||
+                    predicate == CmpInst::ICMP_SGE || predicate == CmpInst::ICMP_SLT ||
+                    predicate == CmpInst::ICMP_SLE || predicate == CmpInst::ICMP_UGT) &&
+                   "We only treat integer inequalities for now");
 
-        if (AllCmps.size() != 1)
-          continue;
+            // só funciona para < e >
+            info->comparison->setOperand(0, ConstantInt::getFalse(F->getContext()));
+            info->comparison->setOperand(1, info->isTrueAtNextPoint);
+            auto comparisonPredicate = info->comparison->getPredicate();
+            info->comparison->setPredicate(ICmpInst::ICMP_EQ);
+            
+            ValueToValueMapTy VMap;
+            
+            auto clonedLoop = cloneLoop(F, loop, LI, DT, "FirstLoop", VMap);
+            info->comparison->setOperand(0, ConstantInt::getTrue(F->getContext()));
+            BranchInst *ClonedBr = cast<BranchInst>(clonedLoop->getExitingBlock()->getTerminator());
+            assert(ClonedBr->isConditional() && "Expected to be conditional!");
+            
+            for (PHINode &PHI : loop->getHeader()->phis()) {
+                PHINode *ClonedPHI = dyn_cast<PHINode>(VMap[&PHI]);
 
-        WorkList = getPairFromCmp(SE, AllCmps, L);
-      }
+                Value *LastValue = ClonedPHI;
+                if (clonedLoop->getExitingBlock() == clonedLoop->getLoopLatch()) {
+                    LastValue =
+                    ClonedPHI->getIncomingValueForBlock(clonedLoop->getLoopLatch());
+                } else
+                    assert(clonedLoop->getExitingBlock() == clonedLoop->getHeader() &&
+                           "Expected exiting block to be the loop header!");
 
-      for (auto &Pair : WorkList)
-      {
-        Loop *L = Pair.first;
+                PHI.setIncomingValue(PHI.getBasicBlockIndex(loop->getLoopPreheader()),
+                                     LastValue);
+            }
+            auto builder = IRBuilder<>(clonedLoop->getHeader()->getFirstNonPHI());
+            
+            if (CmpInst *ExitCmp = dyn_cast<CmpInst>(ClonedBr->getCondition())) {
+                Value *iterationValue;
+                Value *nextIterationValue;
+                if (VMap[info->iterationValue]) {
+                    iterationValue = VMap[info->iterationValue];
+                } else {
+                    iterationValue = info->iterationValue;
+                }
+                
+                if (VMap[info->nextValue]) {
+                    nextIterationValue = VMap[info->nextValue];
+                } else {
+                    nextIterationValue = info->nextValue;
+                }
 
-        for (BasicBlock *BB : L->getBlocks())
-        {
-          errs() << *BB;
+                auto first = info->order == 0 ? iterationValue : nextIterationValue;
+                auto second = info->order == 0 ? nextIterationValue : iterationValue;
+                
+                Value *isTrueAtPoint = VMap[info->isTrueAtPoint];
+                if (isTrueAtPoint == nullptr) {
+                    isTrueAtPoint = info->isTrueAtPoint;
+                }
+                if (comparisonPredicate == CmpInst::ICMP_SGT || comparisonPredicate == CmpInst::ICMP_SGE) {
+                    auto sel = builder.CreateSelect(isTrueAtPoint, second, first);
+                    ExitCmp->setOperand(1, sel);
+                } else {
+                    auto sel = builder.CreateSelect(isTrueAtPoint, first, second);
+                    ExitCmp->setOperand(1, sel);
+                }
+            }
         }
+        
+        bool runOnFunction(Function &F) override {
+            auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+            auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+            auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+            this->expander = new SCEVExpander(SE, DataLayout(F.getParent()), "name");
 
-        CmpInst *Cmp = Pair.second;
+            while (true) {
+                auto allComparisons = collectCandidateInstructions(LI);
+                auto splitInfo = comparisonToSplitInfo(SE, LI, allComparisons);
+                if (splitInfo.size() == 0) break;
+                for (auto splitInfo : splitInfo) {
+                    auto loop = getLoop(splitInfo.comparison, LI, SE);
+                    splitLoop(SE, &F, DT, loop, &LI, &splitInfo);
+                }
+                
+            }
 
-        splitLoop(&F, L, &LI, &SE, Cmp);
+            return true;
+        }
+        
+        void getAnalysisUsage(AnalysisUsage &AU) const override {
+            AU.setPreservesAll();
+            getLoopAnalysisUsage(AU);
+        }
+        
 
-        updated = true;
-      }
-      errs() << "Modified Function:\n";
-      return updated;
-    }
-
-    bool runOnFunction(Function &F) override
-    {
-      auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-      auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-
-      bool updated = false;
-      updated = analyseLoops(F, LI, SE);
-
-      return updated;
-    }
-
-    // We don't modify the program, so we preserve all analyses.
-    void getAnalysisUsage(AnalysisUsage &AU) const override
-    {
-      AU.setPreservesAll();
-      getLoopAnalysisUsage(AU);
-      ;
-    }
-  };
-} // namespace
+    };
+}
 
 char LoopSplitting::ID = 0;
 static RegisterPass<LoopSplitting>
-    Y("loopsplit", "Hello World Pass (with getAnalysisUsage implemented)");
+Y("loopsplit", "Hello World Pass (with getAnalysisUsage implemented)");
